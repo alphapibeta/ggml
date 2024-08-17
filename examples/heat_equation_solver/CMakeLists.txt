@@ -8,9 +8,9 @@ set(TEST_TARGET heat_equation_solver)
 # Add the executable with the source files
 add_executable(${TEST_TARGET}
     main.cpp
-    src/HeatEquationSolver.cpp
     src/FiniteDifference.cpp
-
+    src/HeatEquationSolverWithStreams.cpp
+    src/HeatEquationSolverNoStreams.cpp
 )
 
 # Include the headers
