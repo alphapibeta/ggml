@@ -1,3 +1,4 @@
+
 #include "HeatEquationSolverWithStreams.h"
 #include "HeatEquationSolverNoStreams.h"
 #include "HeatEquationKernels.h"
@@ -133,18 +134,29 @@ void HeatEquationSolverWithStreams::set_initial_condition(const std::vector<floa
         throw std::invalid_argument("Initial temperature vector size does not match grid size");
     }
 
-    // Initialize the top row (y=0) for the entire grid
-    std::vector<float> top_row(nx_, 1000.0f); // Set the entire top row to 1000// Initialize each partition
+
+    std::memcpy(temp_cpu_, initial_temp.data(), nx_ * ny_ * sizeof(float));
+
+    for (int i = 0; i < nx_; ++i) {
+        temp_cpu_[i * ny_] = 1000.0f;
+    }
+
+
+    CUDA_CHECK(cudaMemcpy(d_temp_, temp_cpu_, nx_ * ny_ * sizeof(float), cudaMemcpyHostToDevice));
+
+
     for (int i = 0; i < NUM_STREAMS; ++i) {
-        int offset = i * part_nx_; // Offset for this partition// Create a vector for the current partition with ghost cells included
-        std::vector<float> partition_data(part_nx_ + 2, 0.0f);
+        int start_x = i * part_nx_;
+        int end_x = (i == NUM_STREAMS - 1) ? nx_ : (i + 1) * part_nx_;
+        int width = end_x - start_x;
 
-        // Copy the relevant portion of the top row to the partition, excluding ghost cells
-        for (int x = 1; x <= part_nx_; ++x) {
-            partition_data[x] = top_row[offset + x - 1];
-        }
 
-        // Handle ghost cells
+        CUDA_CHECK(cudaMemcpy2DAsync(d_temp_parts_[i] + 1, (part_nx_ + 2) * sizeof(float),
+                                     d_temp_ + start_x, nx_ * sizeof(float),
+                                     width * sizeof(float), ny_,
+                                     cudaMemcpyDeviceToDevice, streams_[i]));
+
+
         if (i > 0) {
             partition_data[0] = top_row[offset - 1]; // Left ghost cell from previous partition
         }
@@ -163,26 +175,27 @@ void HeatEquationSolverWithStreams::set_initial_condition(const std::vector<floa
 
     // Combine the partitions back into the main grid to ensure consistency
     combine_partitions();
+    print_debug_info(0, true, true);
+}
 
-    // Print the initial condition for debugging with indices
-    std::cout << "Initial Condition for each partition with global indices:" << std::endl;
-    // for (int i = 0; i < NUM_STREAMS; ++i) {
-    //     std::vector<float> part_temp((part_nx_ + 2) * part_ny_);
-    //     CUDA_CHECK(cudaMemcpy(part_temp.data(), d_temp_parts_[i], (part_nx_ + 2) * part_ny_ * sizeof(float), cudaMemcpyDeviceToHost));
 
-    //     std::cout << "Partition " << i << " (global indexing shown as [row, col]):" << std::endl;
-    //     for (int y = 0; y < part_ny_; ++y) {
-    //         for (int x = 0; x < part_nx_ + 2; ++x) { // +2 for ghost cells
-    //         int global_x = (i * part_nx_) + (x - 1); // Calculate global x-index
-    //         int global_y = y; // Global y-index is the same as local y in this case
-    //         if (global_x >= 0 && global_x < nx_) { // Only print valid global indices
-    //                 std::cout << "[" << global_y << "," << global_x << "]=" << std::setw(10) << std::fixed << std::setprecision(4) << part_temp[y * (part_nx_ + 2) + x] << " ";
-    //             }
-    //         }
-    //         std::cout << std::endl;
-    //     }
-    //     std::cout << std::endl;
-    // }
+
+void HeatEquationSolverWithStreams::set_initial_condition_cpu(const std::vector<float>& initial_temp) {
+    std::memcpy(temp_cpu_, initial_temp.data(), nx_ * ny_ * sizeof(float));
+
+    for (int i = 0; i < ny_; ++i) {
+        temp_cpu_[i * nx_] = 1000.0f;
+    }
+}
+
+
+
+
+
+
+void HeatEquationSolverWithStreams::set_initial_condition(const std::vector<float>& initial_temp) {
+    set_initial_condition_gpu(initial_temp);
+    set_initial_condition_cpu(initial_temp);
 }
 
 
@@ -234,32 +247,65 @@ void HeatEquationSolverWithStreams::solve_gpu(int num_steps, KernelType kernelTy
 #ifdef USE_NVTX
         nvtxRangePop(); // End of GPU Step marker
 #endif
+
+    for (int step = 0; step < num_steps; ++step) {
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2)
+#endif
+        for (int i = 1; i < nx_ - 1; ++i) {
+            for (int j = 1; j < ny_ - 1; ++j) {
+                int idx = i * ny_ + j;
+                float laplacian = (u[idx - ny_] + u[idx + ny_] - 2 * u[idx]) / (dx_ * dx_) +
+                                  (u[idx - 1] + u[idx + 1] - 2 * u[idx]) / (dy_ * dy_);
+                u_next[idx] = u[idx] + alpha_ * dt_ * laplacian;
+            }
+        }
+
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int i = 0; i < nx_; ++i) {
+            u_next[i * ny_] = 1000.0f; 
+            u_next[i * ny_ + ny_ - 1] = u[i * ny_ + ny_ - 1]; 
+        }
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int j = 0; j < ny_; ++j) {
+            u_next[j] = u[j]; 
+            u_next[(nx_ - 1) * ny_ + j] = u[(nx_ - 1) * ny_ + j]; 
+        }
+
+        std::swap(u, u_next);
+        std::swap(temp_cpu_, temp_next_cpu_);
+
+        if (step % 1000 == 0) {
+            std::cout << "CPU Step " << step << ", Center temp: " << u[nx_ / 2 * ny_ + ny_ / 2] << std::endl;
+        }
     }
 
-    // Combine partitions into the main grid
-    combine_partitions();
-
-#ifdef USE_NVTX
-    nvtxRangePop(); // End of GPU Solve With Streams marker
-#endif
+    std::memcpy(temp_, temp_cpu_, nx_ * ny_ * sizeof(float));
 }
 
+
 void HeatEquationSolverWithStreams::update_overlapping_regions() {
-    // Copy right edge of left partition to left ghost cells of right partition
-    CUDA_CHECK(cudaMemcpyAsync(d_temp_parts_[1], 
-                               d_temp_parts_[0] + (part_nx_) * ny_, 
-                               ny_ * sizeof(float), 
-                               cudaMemcpyDeviceToDevice, 
-                               streams_[1]));
+    for (int i = 0; i < NUM_STREAMS - 1; ++i) {
 
-    // Copy left edge of right partition to right ghost cells of left partition
-    CUDA_CHECK(cudaMemcpyAsync(d_temp_parts_[0] + (part_nx_ + 1) * ny_, 
-                               d_temp_parts_[1] + ny_, 
-                               ny_ * sizeof(float), 
-                               cudaMemcpyDeviceToDevice, 
-                               streams_[0]));
+        CUDA_CHECK(cudaMemcpy2DAsync(d_temp_parts_[i + 1], (part_nx_ + 2) * sizeof(float),
+                                     d_temp_parts_[i] + part_nx_, (part_nx_ + 2) * sizeof(float),
+                                     sizeof(float), ny_,
+                                     cudaMemcpyDeviceToDevice, streams_[i + 1]));
 
-    // Synchronize all streams
+
+        CUDA_CHECK(cudaMemcpy2DAsync(d_temp_parts_[i] + part_nx_ + 1, (part_nx_ + 2) * sizeof(float),
+                                     d_temp_parts_[i + 1] + 1, (part_nx_ + 2) * sizeof(float),
+                                     sizeof(float), ny_,
+                                     cudaMemcpyDeviceToDevice, streams_[i]));
+    }
+
+
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CUDA_CHECK(cudaStreamSynchronize(streams_[i]));
     }
@@ -273,38 +319,90 @@ void HeatEquationSolverWithStreams::combine_partitions() {
                                    cudaMemcpyDeviceToDevice, streams_[i]));
     }
 
-    // Synchronize all streams
+
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CUDA_CHECK(cudaStreamSynchronize(streams_[i]));
     }
 }
 
-void HeatEquationSolverWithStreams::print_debug_info(int step, bool is_initial) {
-    if (is_initial) {
-        std::cout << "Initial Condition for each partition with global indices:" << std::endl;
-    } else {
-        std::cout << "Temperature field at step " << step << ":" << std::endl;
-    }
+
+
+void HeatEquationSolverWithStreams::reinforce_boundary_conditions() {
+    float boundary_value = 1000.0f;
+
 
     for (int i = 0; i < NUM_STREAMS; ++i) {
-        std::vector<float> part_temp((part_nx_ + 2) * part_ny_);
-        CUDA_CHECK(cudaMemcpy(part_temp.data(), d_temp_parts_[i], (part_nx_ + 2) * part_ny_ * sizeof(float), cudaMemcpyDeviceToHost));
 
-        std::cout << "Partition " << i << " (global indexing shown as [row, col]):" << std::endl;
-        for (int y = 0; y < part_ny_; ++y) {
-            for (int x = 0; x < part_nx_ + 2; ++x) { // +2 for ghost cells
-                int global_x = (i * part_nx_) + (x - 1); // Calculate global x-index
-                int global_y = y; // Global y-index is the same as local y in this case
-                if (global_x >= 0 && global_x < nx_) { // Only print valid global indices
-                    std::cout << "[" << global_y << "," << global_x << "]=" << std::setw(10) << std::fixed << std::setprecision(4) << part_temp[y * (part_nx_ + 2) + x] << " ";
+        CUDA_CHECK(cudaMemcpyAsync(d_temp_parts_[i], &boundary_value, part_nx_ * sizeof(float), cudaMemcpyHostToDevice, streams_[i]));
+    }
+
+
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        CUDA_CHECK(cudaStreamSynchronize(streams_[i]));
+    }
+
+
+    for (int i = 0; i < NUM_STREAMS - 1; ++i) {
+        CUDA_CHECK(cudaMemcpy2DAsync(d_temp_parts_[i + 1], (part_nx_ + 2) * sizeof(float),
+                                     d_temp_parts_[i] + part_nx_, (part_nx_ + 2) * sizeof(float),
+                                     sizeof(float), ny_,
+                                     cudaMemcpyDeviceToDevice, streams_[i + 1]));
+
+        CUDA_CHECK(cudaMemcpy2DAsync(d_temp_parts_[i] + part_nx_ + 1, (part_nx_ + 2) * sizeof(float),
+                                     d_temp_parts_[i + 1] + 1, (part_nx_ + 2) * sizeof(float),
+                                     sizeof(float), ny_,
+                                     cudaMemcpyDeviceToDevice, streams_[i]));
+    }
+
+
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        CUDA_CHECK(cudaStreamSynchronize(streams_[i]));
+    }
+}
+
+
+
+void HeatEquationSolverWithStreams::print_debug_info(int step, bool is_initial, bool use_gpu = true) {
+    std::cout << (is_initial ? "Initial Condition" : "Temperature field at step " + std::to_string(step)) << ":" << std::endl;
+
+    if (use_gpu) {
+        for (int i = 0; i < NUM_STREAMS; ++i) {
+            std::vector<float> part_temp((part_nx_ + 2) * part_ny_);
+            CUDA_CHECK(cudaMemcpy(part_temp.data(), d_temp_parts_[i], (part_nx_ + 2) * part_ny_ * sizeof(float), cudaMemcpyDeviceToHost));
+
+            std::cout << "Partition " << i << " (GPU):" << std::endl;
+            for (int y = 0; y < std::min(10, part_ny_); ++y) {
+                for (int x = 0; x < part_nx_ + 2; ++x) {
+                    int global_x = (i * part_nx_) + (x - 1);
+                    if (global_x >= 0 && global_x < nx_) {
+                        std::cout << std::setw(10) << std::fixed << std::setprecision(4) << part_temp[y * (part_nx_ + 2) + x] << " ";
+                    }
                 }
+                std::cout << std::endl;
             }
             std::cout << std::endl;
         }
-        std::cout << std::endl;
+    } else {
+
+        for (int i = 0; i < NUM_STREAMS; ++i) {
+            std::cout << "Partition " << i << " (CPU):" << std::endl;
+            for (int y = 0; y < std::min(10, part_ny_); ++y) {
+                for (int x = 0; x < part_nx_ + 2; ++x) {
+                    int global_x = (i * part_nx_) + (x - 1);
+                    if (global_x >= 0 && global_x < nx_) {
+                        int idx = y * nx_ + global_x;
+                        std::cout << std::setw(10) << std::fixed << std::setprecision(4) << temp_cpu_[idx] << " ";
+                    }
+                }
+                std::cout << std::endl;
+            }
+            std::cout << std::endl;
+        }
     }
 }
-std::vector<float> HeatEquationSolverWithStreams::get_temperature_field() const {
+
+
+std::vector<float> HeatEquationSolverWithStreams::get_temperature_field_gpu() const {
     std::vector<float> result(nx_ * ny_);
     CUDA_CHECK(cudaMemcpy(result.data(), d_temp_, nx_ * ny_ * sizeof(float), cudaMemcpyDeviceToHost));
     return result;
@@ -313,10 +411,17 @@ std::vector<float> HeatEquationSolverWithStreams::get_temperature_field() const 
 void HeatEquationSolverWithStreams::verify_results(int num_steps, KernelType kernelType, dim3 block_size) {
     std::cout << "Verifying results between CPU and GPU with streams..." << std::endl;
 
-    // Store the initial condition
-    std::vector<float> initial_condition = get_temperature_field();
+    // Generate a proper initial condition
+    std::vector<float> initial_condition(nx_ * ny_, 0.0f);
+    for (int i = 0; i < nx_; ++i) {
+        initial_condition[i * ny_] = 1000.0f;  
+    }
 
-    // Solve on GPU with streams (only once)
+
+    set_initial_condition_gpu(initial_condition);
+    set_initial_condition_cpu(initial_condition);
+
+
     auto gpu_start = std::chrono::high_resolution_clock::now();
     solve_gpu(num_steps, kernelType, block_size);
     auto gpu_end = std::chrono::high_resolution_clock::now();
